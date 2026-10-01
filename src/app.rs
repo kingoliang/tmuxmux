@@ -12,7 +12,7 @@ use crate::config::{Config, Host};
 use crate::db::{self, Db};
 use crate::input::key_event_to_bytes;
 use crate::progresslog::{spawn_fetch, LogResult};
-use crate::restore::{build_restore_script, RestoreResult};
+use crate::restore::{build_restore_script, sh_quote, RestoreResult};
 use crate::snapshot::{spawn_snapshots, PaneSnap, SessionSnap, SnapshotResult};
 use crate::ssh::{build_attach_command, build_new_session_command, build_shell_command};
 use crate::terminal::TerminalPane;
@@ -221,6 +221,10 @@ pub struct App {
 
     pub selection: Option<Selection>,
     selecting: bool,
+    /// Cell span (row, col_start, col_end) currently underlined as an openable
+    /// token under a Ctrl-hover, or `None`. Kept so a change can request a
+    /// repaint and the affordance does not lag the pointer.
+    hover_span: Option<(usize, usize, usize)>,
     clipboard: Option<arboard::Clipboard>,
     pub modal: Option<AppModal>,
 
@@ -350,6 +354,7 @@ impl App {
             favourites,
             selection: None,
             selecting: false,
+            hover_span: None,
             clipboard,
             modal: None,
             layout: None,
@@ -2599,6 +2604,49 @@ impl App {
             }
         }
 
+        // Hover affordance: while a Ctrl (or Ctrl+Shift) hover is over the
+        // pane and an openable token is under the pointer, underline that
+        // token's cell span and show a link cursor — otherwise the gesture is
+        // invisible. The modifier rule mirrors the click exactly: with the
+        // remote app's mouse reporting on, a *bare* Ctrl+click is forwarded to
+        // it and nothing opens locally, so Shift is what reaches us there.
+        let hover_span = if alive {
+            let (ctrl, shift, pointer) =
+                ui.input(|i| (i.modifiers.ctrl, i.modifiers.shift, i.pointer.hover_pos()));
+            let reaches_us = shift || screen.mouse_protocol_mode() == vt100_ctt::MouseProtocolMode::None;
+            match pointer {
+                Some(pos) if ctrl && reaches_us && !self.selecting && avail.contains(pos) => {
+                    let col = (((pos.x - origin.x) / glyph_w).floor() as i64)
+                        .clamp(0, draw_cols.max(1) as i64 - 1) as usize;
+                    let row = (((pos.y - origin.y) / line_h).floor() as i64)
+                        .clamp(0, draw_rows.max(1) as i64 - 1) as usize;
+                    token_span_at(screen, row, col)
+                        .filter(|s| openable(&s.token).is_some())
+                        .map(|s| (row, s.col_start, s.col_end))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if self.hover_span != hover_span {
+            self.hover_span = hover_span;
+            ui.ctx().request_repaint();
+        }
+        if let Some((hrow, c0, c1)) = self.hover_span {
+            let x = origin.x + c0 as f32 * glyph_w;
+            let y = origin.y + hrow as f32 * line_h;
+            let w = (c1 - c0) as f32 * glyph_w;
+            painter.line_segment(
+                [
+                    Pos2::new(x, y + line_h - 1.5),
+                    Pos2::new(x + w, y + line_h - 1.5),
+                ],
+                (1.0, DEFAULT_FG),
+            );
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+
         if !alive {
             let msg = "[ session ended — press Enter to reconnect, or pick another session ]";
             painter.rect_filled(
@@ -2776,13 +2824,16 @@ impl App {
             self.selecting = false;
             if let Some(sel) = self.selection {
                 if sel.anchor == sel.head {
-                    // Plain click: clear selection; Ctrl+click opens URLs.
+                    // Plain click: clear selection; Ctrl+click opens the URL
+                    // or file path under the cursor (Ctrl+Shift+click when the
+                    // remote app has mouse reporting on and would otherwise
+                    // swallow the click).
                     self.selection = None;
                     let ctrl = ui.input(|i| i.modifiers.ctrl);
                     if ctrl {
                         if let Some(pos) = pointer_pos {
                             let (row, col) = to_cell(pos);
-                            self.try_open_url(row, col);
+                            self.try_open_at(row, col);
                         }
                     }
                 }
@@ -2790,7 +2841,13 @@ impl App {
         }
     }
 
-    fn try_open_url(&mut self, row: usize, col: usize) {
+    /// Ctrl+click on a cell: open the token under the cursor. A URL goes
+    /// straight to the OS opener; anything that looks like a file path is
+    /// resolved against the pane's working directory and opened (fetched over
+    /// ssh first when the session is remote). Note that when the remote app
+    /// has mouse reporting on, a bare Ctrl+click is forwarded to it — there
+    /// Shift+Ctrl+click is the gesture that reaches us.
+    fn try_open_at(&mut self, row: usize, col: usize) {
         let key = match self.active_key.as_ref() {
             Some(k) => k,
             None => return,
@@ -2800,39 +2857,155 @@ impl App {
             None => return,
         };
         let screen = pane.parser.screen();
-        let (_, cols) = screen.size();
-        let line: String = (0..cols)
-            .map(|c| {
-                screen
-                    .cell(row as u16, c)
-                    .map(|cell| {
-                        if cell.is_wide_continuation() {
-                            String::new()
-                        } else if cell.has_contents() {
-                            cell.contents().to_string()
-                        } else {
-                            " ".to_string()
-                        }
-                    })
-                    .unwrap_or_else(|| " ".to_string())
-            })
-            .collect();
-        for prefix in ["https://", "http://"] {
-            let mut start = 0;
-            while let Some(idx) = line[start..].find(prefix) {
-                let s = start + idx;
-                let end = line[s..]
-                    .find(|c: char| c.is_whitespace() || c == '"' || c == '\'')
-                    .map(|e| s + e)
-                    .unwrap_or(line.len());
-                if col >= s && col < end {
-                    let url = line[s..end].trim_end_matches([')', ']', '.', ',']);
-                    self.status = format!("opening {url}");
-                    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+        // Row rebuild and token location are shared with the hover affordance
+        // so both agree on what is under the cursor.
+        let span = match token_span_at(screen, row, col) {
+            Some(s) => s,
+            None => return,
+        };
+        match openable(&span.token) {
+            Some((target, true)) => {
+                self.open_target(&target);
+            }
+            Some((target, false)) => self.open_path(&target),
+            None => {}
+        }
+    }
+
+    /// Hand an already-resolved local path or URL to the OS opener; returns
+    /// whether the spawn succeeded. macOS has no `xdg-open` (the old code used
+    /// it unconditionally and swallowed the spawn error, so URL-opening was
+    /// silently broken here); elsewhere keep the freedesktop opener.
+    fn open_target(&mut self, target: &str) -> bool {
+        #[cfg(target_os = "macos")]
+        let prog = "open";
+        #[cfg(not(target_os = "macos"))]
+        let prog = "xdg-open";
+        self.status = format!("opening {target}");
+        match std::process::Command::new(prog)
+            .arg("--")
+            .arg(target)
+            .spawn()
+        {
+            Ok(_) => true,
+            Err(e) => {
+                log::warn!("{prog} {target} failed to spawn: {e}");
+                self.status = format!("open failed: {e} — {target}");
+                false
+            }
+        }
+    }
+
+    /// Open the path token `tok` as shown on screen: resolve it against the
+    /// pane's working directory, then either open it where it lies (local
+    /// session) or copy it into /tmp first (remote session).
+    fn open_path(&mut self, tok: &str) {
+        let key = match self.active_key.clone() {
+            Some(k) => k,
+            None => return,
+        };
+        let (host_name, session_name) = match key.split_once('/') {
+            Some((h, s)) => (h.to_string(), s.to_string()),
+            None => return,
+        };
+        let host = match self.config.hosts.iter().find(|h| h.name == host_name) {
+            Some(h) => h.clone(),
+            None => return,
+        };
+        // Hand the shell an *expression*: a leading `~` must be expanded by
+        // whichever shell ends up running the command, not by us.
+        let expr = if let Some(rest) = tok.strip_prefix("~/") {
+            format!("\"$HOME\"/{}", sh_quote(rest))
+        } else if tok == "~" {
+            "\"$HOME\"".to_string()
+        } else if tok.starts_with('/') {
+            sh_quote(tok)
+        } else {
+            let cwd = match self.session_cwd(&host_name, &session_name) {
+                Some(c) => c,
+                None => {
+                    self.status = format!("no cwd for {key} — {tok}");
                     return;
                 }
-                start = end.max(s + 1);
+            };
+            sh_quote(&format!("{}/{}", cwd.trim_end_matches('/'), tok))
+        };
+
+        self.status = format!("resolving {tok}…");
+        let probe = match probe_path(&host, &expr) {
+            Some(p) => p,
+            None => {
+                self.status = format!("cannot reach {host_name}");
+                return;
             }
+        };
+        if probe.kind == 'x' {
+            self.status = format!("no such file: {tok}");
+            return;
+        }
+
+        // Local session: the file is already here, no copy needed.
+        if host.local && host.command.is_none() {
+            self.open_and_report(&probe.abs);
+            return;
+        }
+        if probe.kind == 'd' {
+            self.copy_path_status(format!("remote dir: {}", probe.abs), &probe.abs);
+            return;
+        }
+        if probe.size > OPEN_SIZE_CAP {
+            let mb = probe.size / (1024 * 1024);
+            self.copy_path_status(
+                format!(
+                    "{mb} MB > {} MB cap, remote path copied: {}",
+                    OPEN_SIZE_CAP / (1024 * 1024),
+                    probe.abs
+                ),
+                &probe.abs,
+            );
+            return;
+        }
+
+        self.status = format!("fetching {} ({} KB)…", probe.abs, probe.size / 1024);
+        let base = probe.abs.rsplit('/').next().unwrap_or("file").to_string();
+        match fetch_to_tmp(&host, &probe.abs, &base) {
+            Ok(p) => self.open_and_report(&p.to_string_lossy()),
+            Err(e) => {
+                log::warn!("fetch {} failed: {e}", probe.abs);
+                self.copy_path_status(format!("fetch failed: {e}"), &probe.abs);
+            }
+        }
+    }
+
+    /// Open a local path and name it in the status bar — with `/tmp` as the
+    /// landing spot for fetched files the path is worth having on screen, so
+    /// the user can grab it.
+    fn open_and_report(&mut self, local: &str) {
+        if self.open_target(local) {
+            self.status = format!("opened {local}");
+        }
+    }
+
+    /// Snapshot working directory of a live session's focused pane.
+    fn session_cwd(&self, host_name: &str, session_name: &str) -> Option<String> {
+        self.hosts
+            .iter()
+            .find(|h| h.host.name == host_name)
+            .and_then(|h| h.sessions.iter().find(|s| s.name == session_name))
+            .and_then(|s| s.cwd.clone())
+            .filter(|c| !c.is_empty())
+    }
+
+    /// Anything we decline to fetch (remote dir, oversized, failed): leave the
+    /// resolved path on the clipboard so the user can paste it into a shell.
+    fn copy_path_status(&mut self, status: String, path: &str) {
+        match self.clipboard.as_mut().map(|c| c.set_text(path.to_string())) {
+            Some(Ok(())) => self.status = format!("{status} — path copied"),
+            Some(Err(e)) => {
+                log::warn!("clipboard: {e}");
+                self.status = format!("{status} — {path}");
+            }
+            None => self.status = format!("{status} — {path}"),
         }
     }
 
@@ -2847,7 +3020,7 @@ impl App {
                 ui.add_space(6.0);
                 ui.colored_label(
                     Color32::from_gray(120),
-                    "drag:select  C-S-c:copy  C-S-v:paste  C-]/\\:cycle  C-S-e:tree  Del:hide  C-+/-:font  C-S-l:log  F2:sidebar  F5:refresh  C-S-q:quit",
+                    "drag:select  C-S-c:copy  C-S-v:paste  C-S+click:open  C-]/\\:cycle  C-S-e:tree  Del:hide  C-+/-:font  C-S-l:log  F2:sidebar  F5:refresh  C-S-q:quit",
                 );
             });
         });
@@ -3194,6 +3367,219 @@ fn active_cwd(s: &SessionSnap) -> Option<String> {
         .or_else(|| s.panes.first())
         .map(|p| p.cwd.clone())
         .filter(|c| !c.is_empty())
+}
+
+/// Largest remote file we will pull over the network on a click.
+const OPEN_SIZE_CAP: u64 = 20 * 1024 * 1024;
+
+/// Extensions that mark a bare screen token as a file even without a `/`.
+const OPEN_EXTS: &[&str] = &[
+    "mp3", "wav", "flac", "m4a", "aac", "ogg", "mp4", "mov", "mkv", "webm", "avi", "gif", "png",
+    "jpg", "jpeg", "heic", "webp", "svg", "pdf", "txt", "md", "log", "json", "toml", "yaml", "yml",
+    "csv", "tsv", "html", "htm", "xml", "rs", "py", "sh", "js", "ts", "tsx", "go", "java", "c", "h",
+    "cpp", "rb", "sql", "zip", "tar", "gz", "bz2", "xz", "srt", "ass", "vtt", "docx", "xlsx",
+    "pptx", "xls", "doc",
+];
+
+/// Is this screen token worth trying to open as a file? Deliberately narrow —
+/// a false positive costs a network round trip. `Some(cleaned)` when it looks
+/// like one, with any `:line[:col]` suffix and trailing punctuation dropped.
+fn path_candidate(tok: &str) -> Option<String> {
+    if tok.is_empty() || tok.len() > 4096 || tok.contains("://") || tok.starts_with('-') {
+        return None;
+    }
+    let mut base = tok;
+    while let Some((head, tail)) = base.rsplit_once(':') {
+        if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) {
+            base = head;
+        } else {
+            break;
+        }
+    }
+    if base.is_empty() || base == "/" {
+        return None;
+    }
+    let ext = std::path::Path::new(base)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    let looks = base.contains('/') || base.starts_with('~') || OPEN_EXTS.contains(&ext.as_str());
+    looks.then(|| base.to_string())
+}
+
+/// Would a Ctrl+click act on this screen token? `Some((target, is_url))` when
+/// so — a URL is handed to the opener as-is, a path goes through the resolver.
+/// Shared by the click handler and the hover affordance, so the underline can
+/// never mark a token a click would ignore, or miss one it would act on.
+fn openable(token: &str) -> Option<(String, bool)> {
+    if token.starts_with("http://") || token.starts_with("https://") {
+        return Some((
+            token.trim_end_matches([')', ']', '.', ',']).to_string(),
+            true,
+        ));
+    }
+    path_candidate(token.trim_end_matches([')', ']', '.', ',', ';'])).map(|c| (c, false))
+}
+
+/// A run of non-delimiter characters under a screen cell, with the cell-column
+/// span it covers. `col_end` is exclusive.
+struct TokenSpan {
+    token: String,
+    col_start: usize,
+    col_end: usize,
+}
+
+/// Find the token under a cell. The row is rebuilt char by char as the screen
+/// actually lays it out, keeping a char→column map: past a wide (CJK) glyph the
+/// char index and the screen column diverge, so a hit column can only be
+/// located through that map. A wide glyph's continuation cell owns no char, so
+/// a hit on it belongs to the wide glyph before it. `None` on a delimiter, on
+/// an out-of-range cell, or on an empty row.
+fn token_span_at(screen: &vt100_ctt::Screen, row: usize, col: usize) -> Option<TokenSpan> {
+    let (_, cols) = screen.size();
+    let mut chars: Vec<char> = Vec::with_capacity(cols as usize);
+    let mut col_of: Vec<usize> = Vec::with_capacity(cols as usize);
+    for c in 0..cols {
+        let cell = match screen.cell(row as u16, c) {
+            Some(cell) => cell,
+            None => continue,
+        };
+        if cell.is_wide_continuation() {
+            continue;
+        }
+        let s = if cell.has_contents() {
+            cell.contents().to_string()
+        } else {
+            " ".to_string()
+        };
+        for ch in s.chars() {
+            chars.push(ch);
+            col_of.push(c as usize);
+        }
+    }
+    // The hit char, or the last one left of it (a hit can land on the trailing
+    // half of a wide glyph, which owns no char of its own).
+    let at = match col_of.iter().position(|c| *c == col) {
+        Some(i) => i,
+        None => match col_of.iter().rposition(|c| *c < col) {
+            Some(i) => i,
+            None => return None,
+        },
+    };
+    let is_delim =
+        |ch: char| ch.is_whitespace() || ch == '"' || ch == '\'' || ch == '<' || ch == '>';
+    if is_delim(chars[at]) {
+        return None;
+    }
+    let start = (0..at)
+        .rev()
+        .take_while(|i| !is_delim(chars[*i]))
+        .last()
+        .unwrap_or(at);
+    let end = (at..chars.len())
+        .take_while(|i| !is_delim(chars[*i]))
+        .last()
+        .map(|i| i + 1)
+        .unwrap_or(chars.len());
+    // A wide glyph owns its cell *and* the continuation cell we skipped, so the
+    // span has to include that second cell or the underline falls a cell short.
+    let last_col = col_of[end - 1];
+    let last_w = match screen.cell(row as u16, last_col as u16) {
+        Some(cell) if cell.is_wide() => 2,
+        _ => 1,
+    };
+    Some(TokenSpan {
+        token: chars[start..end].iter().collect(),
+        col_start: col_of[start],
+        col_end: last_col + last_w,
+    })
+}
+
+/// What a path name points at on the host, and where it really lives.
+struct PathProbe {
+    /// 'f' file, 'd' directory, 'x' missing.
+    kind: char,
+    size: u64,
+    /// Absolute path, symlinks resolved by `pwd -P` (so `~` and relative
+    /// paths come back usable by anything that doesn't run a shell).
+    abs: String,
+}
+
+/// One round trip to the host's shell: exists? file or dir? how big? absolute
+/// where? `expr` must already be quoted and may use `$HOME`. Returns None if
+/// the host couldn't be reached or the shell said something unexpected.
+fn probe_path(host: &Host, expr: &str) -> Option<PathProbe> {
+    let script = format!(
+        "p={expr}\n\
+         if [ -d \"$p\" ]; then r=d; elif [ -f \"$p\" ]; then r=f; else r=x; fi\n\
+         if [ \"$r\" = x ]; then printf 'x\\n0\\n\\n'; exit 0; fi\n\
+         s=$(stat -f%z -- \"$p\" 2>/dev/null || stat -c%s -- \"$p\" 2>/dev/null || wc -c <\"$p\")\n\
+         d=$(cd -- \"$(dirname -- \"$p\")\" && pwd -P)\n\
+         printf '%s\\n%s\\n%s/%s\\n' \"$r\" \"$s\" \"$d\" \"$(basename -- \"$p\")\""
+    );
+    let parts = build_shell_command(host, &script);
+    let out = std::process::Command::new(&parts[0])
+        .args(&parts[1..])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    if !out.status.success() {
+        log::warn!("probe {:?} on {}: {}", expr, host.name, out.status);
+        return None;
+    }
+    let mut lines = text.lines();
+    let kind = lines.next()?.trim().chars().next()?;
+    let size = lines.next()?.trim().parse().unwrap_or(0);
+    let abs = lines.next()?.trim().to_string();
+    Some(PathProbe { kind, size, abs })
+}
+
+/// Copy `abs` off `host` into `dir/basename`, returning the local file. `scp`
+/// is the fast path for plain ssh hosts; `cat` over the very same ssh
+/// invocation the pane uses is the fallback — and the only option for a host
+/// reached through a custom `command`, which scp knows nothing about.
+/// Copy `abs` off `host` into `/tmp/<basename>`, returning the local file.
+/// `/tmp` rather than `$TMPDIR` on purpose: `$TMPDIR` is a hashed
+/// `/var/folders/...` path that is awkward to find by hand, while `/tmp` is a
+/// real, browseable directory whose contents survive. Re-opening the same
+/// file just overwrites it, which keeps the path predictable. `scp` is the
+/// fast path for plain ssh hosts; `cat` over the very same ssh invocation the
+/// pane uses is the fallback — and the only option for a host reached through
+/// a custom `command`, which scp knows nothing about.
+fn fetch_to_tmp(host: &Host, abs: &str, basename: &str) -> std::io::Result<PathBuf> {
+    let dir = std::path::Path::new("/tmp");
+    let dest = dir.join(basename);
+    if host.command.is_none() && !host.local && scp_available() {
+        let target = format!("{}:{}", crate::ssh::ssh_target(host), abs);
+        let status = std::process::Command::new("scp")
+            .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"])
+            .arg("--")
+            .arg(&target)
+            .arg(&dest)
+            .status()?;
+        if status.success() {
+            return Ok(dest);
+        }
+        log::warn!("scp {target} failed ({status}); falling back to cat");
+    }
+    let parts = build_shell_command(host, &format!("cat -- {}", sh_quote(abs)));
+    let status = std::process::Command::new(&parts[0])
+        .args(&parts[1..])
+        .stdout(std::fs::File::create(&dest)?)
+        .status()?;
+    if !status.success() {
+        return Err(std::io::Error::other(format!("cat exited with {status}")));
+    }
+    Ok(dest)
+}
+
+fn scp_available() -> bool {
+    std::process::Command::new("sh")
+        .args(["-c", "command -v scp >/dev/null 2>&1"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Sidebar hint for a live session: the short name of the first pane that's
