@@ -131,8 +131,31 @@ impl Selection {
             (self.head, self.anchor)
         }
     }
-    fn contains(&self, row: usize, col: usize) -> bool {
-        let (start, end) = self.ordered();
+    /// Ordered endpoints, widened so that no double-width glyph is left
+    /// half-covered: a start that lands on the right half of a wide glyph
+    /// belongs to that glyph, and an end on its left half spans it whole.
+    /// Every selection consumer goes through this so the highlight geometry
+    /// and the extracted text agree on one cell basis.
+    fn span(&self, screen: &vt100_ctt::Screen) -> ((usize, usize), (usize, usize)) {
+        let (_, cols) = screen.size();
+        let (mut start, mut end) = self.ordered();
+        let test = |(r, c): (usize, usize), f: fn(&vt100_ctt::Cell) -> bool| {
+            screen
+                .cell(r as u16, c as u16)
+                .map(f)
+                .unwrap_or(false)
+        };
+        if start.1 > 0 && test(start, vt100_ctt::Cell::is_wide_continuation) {
+            start.1 -= 1;
+        }
+        if end.1 + 1 < cols as usize && test(end, vt100_ctt::Cell::is_wide) {
+            end.1 += 1;
+        }
+        (start, end)
+    }
+
+    fn contains(&self, screen: &vt100_ctt::Screen, row: usize, col: usize) -> bool {
+        let (start, end) = self.span(screen);
         (row, col) >= start && (row, col) <= end
     }
 }
@@ -1139,7 +1162,7 @@ impl App {
         let pane = self.panes.get(key)?;
         let screen = pane.parser.screen();
         let (rows, cols) = screen.size();
-        let ((sr, sc), (er, ec)) = sel.ordered();
+        let ((sr, sc), (er, ec)) = sel.span(screen);
         let mut lines: Vec<String> = Vec::new();
         for row in sr..=er.min(rows as usize - 1) {
             let c0 = if row == sr { sc } else { 0 };
@@ -3091,7 +3114,7 @@ fn cell_bg(
     selection: &Option<Selection>,
 ) -> Color32 {
     if let Some(sel) = selection {
-        if sel.contains(row, col) {
+        if sel.contains(screen, row, col) {
             return SELECTION_BG;
         }
     }
