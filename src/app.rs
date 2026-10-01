@@ -1298,6 +1298,21 @@ impl App {
                         self.set_font(14.0);
                         continue;
                     }
+                    // macOS: egui-winit only treats Cmd as the clipboard
+                    // modifier, so the Ctrl+Shift+C/X/V binding documented in
+                    // the README arrives here as a plain key event. Honour it
+                    // instead of letting it fall through to the Ctrl byte.
+                    if cfg!(target_os = "macos")
+                        && mods.ctrl
+                        && mods.shift
+                        && matches!(*key, egui::Key::C | egui::Key::X | egui::Key::V)
+                    {
+                        match *key {
+                            egui::Key::V => self.paste_clipboard(),
+                            _ => self.copy_selection(),
+                        }
+                        continue;
+                    }
                     match self.focus {
                         Focus::Terminal => {
                             // Enter on a dead pane reconnects (matches the banner).
@@ -1342,20 +1357,26 @@ impl App {
                 // egui-winit swallows Ctrl+C/X/V (with or without shift) and
                 // emits these instead. Shift distinguishes copy/paste from the
                 // raw control bytes a terminal needs (Ctrl+C must stay SIGINT).
+                // On macOS egui-winit only emits these for Cmd (a real Ctrl+C
+                // stays a plain key event that still reaches the pty as
+                // SIGINT), so there they always mean the clipboard and Cmd+C /
+                // Cmd+X / Cmd+V need no Shift.
                 egui::Event::Copy => {
-                    if modifiers.shift {
+                    if modifiers.shift || cfg!(target_os = "macos") {
                         self.copy_selection();
                     } else if self.focus == Focus::Terminal {
                         self.write_pty(&[0x03]);
                     }
                 }
                 egui::Event::Cut => {
-                    if self.focus == Focus::Terminal && !modifiers.shift {
+                    if modifiers.shift || cfg!(target_os = "macos") {
+                        self.copy_selection();
+                    } else if self.focus == Focus::Terminal {
                         self.write_pty(&[0x18]);
                     }
                 }
                 egui::Event::Paste(s) => {
-                    if modifiers.shift {
+                    if modifiers.shift || cfg!(target_os = "macos") {
                         let s = s.clone();
                         self.paste_text(&s);
                     } else if self.focus == Focus::Terminal {
