@@ -2871,11 +2871,11 @@ impl App {
         }
     }
 
-    /// Hand an already-resolved local path or URL to the OS opener. macOS has
-    /// no `xdg-open` (the old code used it unconditionally and swallowed the
-    /// spawn error, so URL-opening was silently broken here); elsewhere keep
-    /// the freedesktop opener.
-    fn open_target(&mut self, target: &str) {
+    /// Hand an already-resolved local path or URL to the OS opener; returns
+    /// whether the spawn succeeded. macOS has no `xdg-open` (the old code used
+    /// it unconditionally and swallowed the spawn error, so URL-opening was
+    /// silently broken here); elsewhere keep the freedesktop opener.
+    fn open_target(&mut self, target: &str) -> bool {
         #[cfg(target_os = "macos")]
         let prog = "open";
         #[cfg(not(target_os = "macos"))]
@@ -2886,17 +2886,18 @@ impl App {
             .arg(target)
             .spawn()
         {
-            Ok(_) => {}
+            Ok(_) => true,
             Err(e) => {
                 log::warn!("{prog} {target} failed to spawn: {e}");
                 self.status = format!("open failed: {e} — {target}");
+                false
             }
         }
     }
 
     /// Open the path token `tok` as shown on screen: resolve it against the
     /// pane's working directory, then either open it where it lies (local
-    /// session) or copy it into $TMPDIR first (remote session).
+    /// session) or copy it into /tmp first (remote session).
     fn open_path(&mut self, tok: &str) {
         let key = match self.active_key.clone() {
             Some(k) => k,
@@ -2944,7 +2945,7 @@ impl App {
 
         // Local session: the file is already here, no copy needed.
         if host.local && host.command.is_none() {
-            self.open_target(&probe.abs);
+            self.open_and_report(&probe.abs);
             return;
         }
         if probe.kind == 'd' {
@@ -2954,21 +2955,33 @@ impl App {
         if probe.size > OPEN_SIZE_CAP {
             let mb = probe.size / (1024 * 1024);
             self.copy_path_status(
-                format!("{mb} MB > {} MB cap: {}", OPEN_SIZE_CAP / (1024 * 1024), probe.abs),
+                format!(
+                    "{mb} MB > {} MB cap, remote path copied: {}",
+                    OPEN_SIZE_CAP / (1024 * 1024),
+                    probe.abs
+                ),
                 &probe.abs,
             );
             return;
         }
 
         self.status = format!("fetching {} ({} KB)…", probe.abs, probe.size / 1024);
-        let dir = std::env::temp_dir().join("tmuxmux-open");
         let base = probe.abs.rsplit('/').next().unwrap_or("file").to_string();
-        match fetch_to_temp(&host, &probe.abs, &dir, &base) {
-            Ok(p) => self.open_target(&p.to_string_lossy()),
+        match fetch_to_tmp(&host, &probe.abs, &base) {
+            Ok(p) => self.open_and_report(&p.to_string_lossy()),
             Err(e) => {
                 log::warn!("fetch {} failed: {e}", probe.abs);
                 self.copy_path_status(format!("fetch failed: {e}"), &probe.abs);
             }
+        }
+    }
+
+    /// Open a local path and name it in the status bar — with `/tmp` as the
+    /// landing spot for fetched files the path is worth having on screen, so
+    /// the user can grab it.
+    fn open_and_report(&mut self, local: &str) {
+        if self.open_target(local) {
+            self.status = format!("opened {local}");
         }
     }
 
@@ -3437,13 +3450,16 @@ fn probe_path(host: &Host, expr: &str) -> Option<PathProbe> {
 /// is the fast path for plain ssh hosts; `cat` over the very same ssh
 /// invocation the pane uses is the fallback — and the only option for a host
 /// reached through a custom `command`, which scp knows nothing about.
-fn fetch_to_temp(
-    host: &Host,
-    abs: &str,
-    dir: &std::path::Path,
-    basename: &str,
-) -> std::io::Result<PathBuf> {
-    std::fs::create_dir_all(dir)?;
+/// Copy `abs` off `host` into `/tmp/<basename>`, returning the local file.
+/// `/tmp` rather than `$TMPDIR` on purpose: `$TMPDIR` is a hashed
+/// `/var/folders/...` path that is awkward to find by hand, while `/tmp` is a
+/// real, browseable directory whose contents survive. Re-opening the same
+/// file just overwrites it, which keeps the path predictable. `scp` is the
+/// fast path for plain ssh hosts; `cat` over the very same ssh invocation the
+/// pane uses is the fallback — and the only option for a host reached through
+/// a custom `command`, which scp knows nothing about.
+fn fetch_to_tmp(host: &Host, abs: &str, basename: &str) -> std::io::Result<PathBuf> {
+    let dir = std::path::Path::new("/tmp");
     let dest = dir.join(basename);
     if host.command.is_none() && !host.local && scp_available() {
         let target = format!("{}:{}", crate::ssh::ssh_target(host), abs);
