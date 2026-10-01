@@ -221,6 +221,10 @@ pub struct App {
 
     pub selection: Option<Selection>,
     selecting: bool,
+    /// Cell span (row, col_start, col_end) currently underlined as an openable
+    /// token under a Ctrl-hover, or `None`. Kept so a change can request a
+    /// repaint and the affordance does not lag the pointer.
+    hover_span: Option<(usize, usize, usize)>,
     clipboard: Option<arboard::Clipboard>,
     pub modal: Option<AppModal>,
 
@@ -350,6 +354,7 @@ impl App {
             favourites,
             selection: None,
             selecting: false,
+            hover_span: None,
             clipboard,
             modal: None,
             layout: None,
@@ -2599,6 +2604,49 @@ impl App {
             }
         }
 
+        // Hover affordance: while a Ctrl (or Ctrl+Shift) hover is over the
+        // pane and an openable token is under the pointer, underline that
+        // token's cell span and show a link cursor — otherwise the gesture is
+        // invisible. The modifier rule mirrors the click exactly: with the
+        // remote app's mouse reporting on, a *bare* Ctrl+click is forwarded to
+        // it and nothing opens locally, so Shift is what reaches us there.
+        let hover_span = if alive {
+            let (ctrl, shift, pointer) =
+                ui.input(|i| (i.modifiers.ctrl, i.modifiers.shift, i.pointer.hover_pos()));
+            let reaches_us = shift || screen.mouse_protocol_mode() == vt100_ctt::MouseProtocolMode::None;
+            match pointer {
+                Some(pos) if ctrl && reaches_us && !self.selecting && avail.contains(pos) => {
+                    let col = (((pos.x - origin.x) / glyph_w).floor() as i64)
+                        .clamp(0, draw_cols.max(1) as i64 - 1) as usize;
+                    let row = (((pos.y - origin.y) / line_h).floor() as i64)
+                        .clamp(0, draw_rows.max(1) as i64 - 1) as usize;
+                    token_span_at(screen, row, col)
+                        .filter(|s| openable(&s.token).is_some())
+                        .map(|s| (row, s.col_start, s.col_end))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if self.hover_span != hover_span {
+            self.hover_span = hover_span;
+            ui.ctx().request_repaint();
+        }
+        if let Some((hrow, c0, c1)) = self.hover_span {
+            let x = origin.x + c0 as f32 * glyph_w;
+            let y = origin.y + hrow as f32 * line_h;
+            let w = (c1 - c0) as f32 * glyph_w;
+            painter.line_segment(
+                [
+                    Pos2::new(x, y + line_h - 1.5),
+                    Pos2::new(x + w, y + line_h - 1.5),
+                ],
+                (1.0, DEFAULT_FG),
+            );
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+
         if !alive {
             let msg = "[ session ended — press Enter to reconnect, or pick another session ]";
             painter.rect_filled(
@@ -2809,65 +2857,18 @@ impl App {
             None => return,
         };
         let screen = pane.parser.screen();
-        let (_, cols) = screen.size();
-        // Rebuild the row, dropping wide-glyph continuation cells. Unlike the
-        // old version we also record the *column* each char sits in: past a
-        // wide (CJK) glyph, char index and screen column diverge, so the
-        // clicked column can only be located through that map.
-        let mut chars: Vec<char> = Vec::with_capacity(cols as usize);
-        let mut col_of: Vec<usize> = Vec::with_capacity(cols as usize);
-        for c in 0..cols {
-            let cell = match screen.cell(row as u16, c) {
-                Some(cell) => cell,
-                None => continue,
-            };
-            if cell.is_wide_continuation() {
-                continue;
-            }
-            let s = if cell.has_contents() {
-                cell.contents().to_string()
-            } else {
-                " ".to_string()
-            };
-            for ch in s.chars() {
-                chars.push(ch);
-                col_of.push(c as usize);
-            }
-        }
-        // The clicked char, or the last one left of it (a click can land on
-        // the trailing half of a wide glyph, which owns no char of its own).
-        let at = match col_of.iter().position(|c| *c == col) {
-            Some(i) => i,
-            None => match col_of.iter().rposition(|c| *c < col) {
-                Some(i) => i,
-                None => return,
-            },
+        // Row rebuild and token location are shared with the hover affordance
+        // so both agree on what is under the cursor.
+        let span = match token_span_at(screen, row, col) {
+            Some(s) => s,
+            None => return,
         };
-        let is_delim =
-            |ch: char| ch.is_whitespace() || ch == '"' || ch == '\'' || ch == '<' || ch == '>';
-        if is_delim(chars[at]) {
-            return;
-        }
-        let start = (0..at)
-            .rev()
-            .take_while(|i| !is_delim(chars[*i]))
-            .last()
-            .unwrap_or(at);
-        let end = (at..chars.len())
-            .take_while(|i| !is_delim(chars[*i]))
-            .last()
-            .map(|i| i + 1)
-            .unwrap_or(chars.len());
-        let token: String = chars[start..end].iter().collect();
-
-        if token.starts_with("http://") || token.starts_with("https://") {
-            let url = token.trim_end_matches([')', ']', '.', ',']).to_string();
-            self.open_target(&url);
-            return;
-        }
-        let cleaned = token.trim_end_matches([')', ']', '.', ',', ';']);
-        if let Some(cand) = path_candidate(cleaned) {
-            self.open_path(&cand);
+        match openable(&span.token) {
+            Some((target, true)) => {
+                self.open_target(&target);
+            }
+            Some((target, false)) => self.open_path(&target),
+            None => {}
         }
     }
 
@@ -3405,6 +3406,94 @@ fn path_candidate(tok: &str) -> Option<String> {
         .unwrap_or_default();
     let looks = base.contains('/') || base.starts_with('~') || OPEN_EXTS.contains(&ext.as_str());
     looks.then(|| base.to_string())
+}
+
+/// Would a Ctrl+click act on this screen token? `Some((target, is_url))` when
+/// so — a URL is handed to the opener as-is, a path goes through the resolver.
+/// Shared by the click handler and the hover affordance, so the underline can
+/// never mark a token a click would ignore, or miss one it would act on.
+fn openable(token: &str) -> Option<(String, bool)> {
+    if token.starts_with("http://") || token.starts_with("https://") {
+        return Some((
+            token.trim_end_matches([')', ']', '.', ',']).to_string(),
+            true,
+        ));
+    }
+    path_candidate(token.trim_end_matches([')', ']', '.', ',', ';'])).map(|c| (c, false))
+}
+
+/// A run of non-delimiter characters under a screen cell, with the cell-column
+/// span it covers. `col_end` is exclusive.
+struct TokenSpan {
+    token: String,
+    col_start: usize,
+    col_end: usize,
+}
+
+/// Find the token under a cell. The row is rebuilt char by char as the screen
+/// actually lays it out, keeping a char→column map: past a wide (CJK) glyph the
+/// char index and the screen column diverge, so a hit column can only be
+/// located through that map. A wide glyph's continuation cell owns no char, so
+/// a hit on it belongs to the wide glyph before it. `None` on a delimiter, on
+/// an out-of-range cell, or on an empty row.
+fn token_span_at(screen: &vt100_ctt::Screen, row: usize, col: usize) -> Option<TokenSpan> {
+    let (_, cols) = screen.size();
+    let mut chars: Vec<char> = Vec::with_capacity(cols as usize);
+    let mut col_of: Vec<usize> = Vec::with_capacity(cols as usize);
+    for c in 0..cols {
+        let cell = match screen.cell(row as u16, c) {
+            Some(cell) => cell,
+            None => continue,
+        };
+        if cell.is_wide_continuation() {
+            continue;
+        }
+        let s = if cell.has_contents() {
+            cell.contents().to_string()
+        } else {
+            " ".to_string()
+        };
+        for ch in s.chars() {
+            chars.push(ch);
+            col_of.push(c as usize);
+        }
+    }
+    // The hit char, or the last one left of it (a hit can land on the trailing
+    // half of a wide glyph, which owns no char of its own).
+    let at = match col_of.iter().position(|c| *c == col) {
+        Some(i) => i,
+        None => match col_of.iter().rposition(|c| *c < col) {
+            Some(i) => i,
+            None => return None,
+        },
+    };
+    let is_delim =
+        |ch: char| ch.is_whitespace() || ch == '"' || ch == '\'' || ch == '<' || ch == '>';
+    if is_delim(chars[at]) {
+        return None;
+    }
+    let start = (0..at)
+        .rev()
+        .take_while(|i| !is_delim(chars[*i]))
+        .last()
+        .unwrap_or(at);
+    let end = (at..chars.len())
+        .take_while(|i| !is_delim(chars[*i]))
+        .last()
+        .map(|i| i + 1)
+        .unwrap_or(chars.len());
+    // A wide glyph owns its cell *and* the continuation cell we skipped, so the
+    // span has to include that second cell or the underline falls a cell short.
+    let last_col = col_of[end - 1];
+    let last_w = match screen.cell(row as u16, last_col as u16) {
+        Some(cell) if cell.is_wide() => 2,
+        _ => 1,
+    };
+    Some(TokenSpan {
+        token: chars[start..end].iter().collect(),
+        col_start: col_of[start],
+        col_end: last_col + last_w,
+    })
 }
 
 /// What a path name points at on the host, and where it really lives.
