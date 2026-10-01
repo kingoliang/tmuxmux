@@ -23,3 +23,10 @@ serde_json = "1"
 opt-level = 3
 # "thin" — full LTO gets the compiler OOM-killed on 16GB machines
 lto = "thin"
+
+# Local copy of vt100-ctt carrying one fix: Row::resize() (hit by every pane
+# resize) truncated rows without repairing a wide glyph left in the last
+# column, so the next write there panicked inside the dependency. Drop this
+# patch — and the vendor/ copy — once upstream ships it.
+[patch.crates-io]
+vt100-ctt = { path = "vendor/vt100-ctt" }
