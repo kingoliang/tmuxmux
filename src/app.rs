@@ -131,8 +131,31 @@ impl Selection {
             (self.head, self.anchor)
         }
     }
-    fn contains(&self, row: usize, col: usize) -> bool {
-        let (start, end) = self.ordered();
+    /// Ordered endpoints, widened so that no double-width glyph is left
+    /// half-covered: a start that lands on the right half of a wide glyph
+    /// belongs to that glyph, and an end on its left half spans it whole.
+    /// Every selection consumer goes through this so the highlight geometry
+    /// and the extracted text agree on one cell basis.
+    fn span(&self, screen: &vt100_ctt::Screen) -> ((usize, usize), (usize, usize)) {
+        let (_, cols) = screen.size();
+        let (mut start, mut end) = self.ordered();
+        let test = |(r, c): (usize, usize), f: fn(&vt100_ctt::Cell) -> bool| {
+            screen
+                .cell(r as u16, c as u16)
+                .map(f)
+                .unwrap_or(false)
+        };
+        if start.1 > 0 && test(start, vt100_ctt::Cell::is_wide_continuation) {
+            start.1 -= 1;
+        }
+        if end.1 + 1 < cols as usize && test(end, vt100_ctt::Cell::is_wide) {
+            end.1 += 1;
+        }
+        (start, end)
+    }
+
+    fn contains(&self, screen: &vt100_ctt::Screen, row: usize, col: usize) -> bool {
+        let (start, end) = self.span(screen);
         (row, col) >= start && (row, col) <= end
     }
 }
@@ -202,6 +225,9 @@ pub struct App {
     pub modal: Option<AppModal>,
 
     layout: Option<TermLayout>,
+    /// Live IME composition string, drawn at the terminal cursor while the
+    /// user is composing. `None` when not composing.
+    preedit: Option<String>,
     status: String,
     font_size: f32,
 }
@@ -327,8 +353,9 @@ impl App {
             clipboard,
             modal: None,
             layout: None,
+            preedit: None,
             status: "loading sessions...".into(),
-            font_size: 14.0,
+            font_size: 17.0,
         };
         if key_generated {
             app.status = "generated a new SSH key in ~/.ssh for key-based access".into();
@@ -1079,6 +1106,19 @@ impl App {
         self.panes.get_mut(&key)
     }
 
+    /// Encode committed text for the pty. Shared by `Event::Text` and IME
+    /// commits so the encoding lives in exactly one place: Alt+letter still
+    /// sends an ESC prefix (these events carry no modifiers of their own, so
+    /// the caller passes the live modifier state).
+    fn send_text(&mut self, t: &str, modifiers: egui::Modifiers) {
+        let mut data = Vec::new();
+        if modifiers.alt && !modifiers.ctrl {
+            data.push(0x1b);
+        }
+        data.extend_from_slice(t.as_bytes());
+        self.write_pty(&data);
+    }
+
     fn write_pty(&mut self, data: &[u8]) {
         if data.is_empty() {
             return;
@@ -1122,7 +1162,7 @@ impl App {
         let pane = self.panes.get(key)?;
         let screen = pane.parser.screen();
         let (rows, cols) = screen.size();
-        let ((sr, sc), (er, ec)) = sel.ordered();
+        let ((sr, sc), (er, ec)) = sel.span(screen);
         let mut lines: Vec<String> = Vec::new();
         for row in sr..=er.min(rows as usize - 1) {
             let c0 = if row == sr { sc } else { 0 };
@@ -1281,6 +1321,21 @@ impl App {
                         self.set_font(14.0);
                         continue;
                     }
+                    // macOS: egui-winit only treats Cmd as the clipboard
+                    // modifier, so the Ctrl+Shift+C/X/V binding documented in
+                    // the README arrives here as a plain key event. Honour it
+                    // instead of letting it fall through to the Ctrl byte.
+                    if cfg!(target_os = "macos")
+                        && mods.ctrl
+                        && mods.shift
+                        && matches!(*key, egui::Key::C | egui::Key::X | egui::Key::V)
+                    {
+                        match *key {
+                            egui::Key::V => self.paste_clipboard(),
+                            _ => self.copy_selection(),
+                        }
+                        continue;
+                    }
                     match self.focus {
                         Focus::Terminal => {
                             // Enter on a dead pane reconnects (matches the banner).
@@ -1312,16 +1367,7 @@ impl App {
                 }
                 egui::Event::Text(t) => {
                     match self.focus {
-                        Focus::Terminal => {
-                            let mut data = Vec::new();
-                            // Alt+letter sends ESC prefix (Text events carry no
-                            // modifiers, so consult the live modifier state).
-                            if modifiers.alt && !modifiers.ctrl {
-                                data.push(0x1b);
-                            }
-                            data.extend_from_slice(t.as_bytes());
-                            self.write_pty(&data);
-                        }
+                        Focus::Terminal => self.send_text(t, modifiers),
                         Focus::Tree => {
                             match t.as_str() {
                                 "j" => self.handle_tree_key(egui::Key::ArrowDown),
@@ -1334,27 +1380,87 @@ impl App {
                 // egui-winit swallows Ctrl+C/X/V (with or without shift) and
                 // emits these instead. Shift distinguishes copy/paste from the
                 // raw control bytes a terminal needs (Ctrl+C must stay SIGINT).
+                // On macOS egui-winit only emits these for Cmd (a real Ctrl+C
+                // stays a plain key event that still reaches the pty as
+                // SIGINT), so there they always mean the clipboard and Cmd+C /
+                // Cmd+X / Cmd+V need no Shift.
                 egui::Event::Copy => {
-                    if modifiers.shift {
+                    if modifiers.shift || cfg!(target_os = "macos") {
                         self.copy_selection();
                     } else if self.focus == Focus::Terminal {
                         self.write_pty(&[0x03]);
                     }
                 }
                 egui::Event::Cut => {
-                    if self.focus == Focus::Terminal && !modifiers.shift {
+                    if modifiers.shift || cfg!(target_os = "macos") {
+                        self.copy_selection();
+                    } else if self.focus == Focus::Terminal {
                         self.write_pty(&[0x18]);
                     }
                 }
                 egui::Event::Paste(s) => {
-                    if modifiers.shift {
+                    if modifiers.shift || cfg!(target_os = "macos") {
                         let s = s.clone();
                         self.paste_text(&s);
                     } else if self.focus == Focus::Terminal {
                         self.write_pty(&[0x16]);
                     }
                 }
+                // OS input-method composition. A commit takes the same pty
+                // path as Event::Text; preedit is purely visual feedback.
+                egui::Event::Ime(ime) => {
+                    if self.focus == Focus::Terminal {
+                        match ime {
+                            egui::ImeEvent::Commit(t) => {
+                                self.preedit = None;
+                                self.send_text(t, modifiers);
+                                ctx.request_repaint();
+                            }
+                            egui::ImeEvent::Preedit(t) => {
+                                self.preedit = (!t.is_empty()).then(|| t.clone());
+                                ctx.request_repaint();
+                            }
+                            egui::ImeEvent::Disabled => {
+                                self.preedit = None;
+                                ctx.request_repaint();
+                            }
+                            egui::ImeEvent::Enabled => {}
+                        }
+                    }
+                }
                 _ => {}
+            }
+        }
+
+        // Let egui-winit enable IME for the terminal pane: it derives
+        // `window.set_ime_allowed` from `output.ime` being `Some`. This is
+        // done here rather than in `render_terminal` because `handle_events`
+        // runs first and returns early while a modal (or the sidebar filter)
+        // owns keyboard focus — in that case the TextEdit writes `output.ime`
+        // itself, later in the same frame, and therefore wins.
+        if self.focus == Focus::Terminal {
+            let cursor = self
+                .active_pane_mut()
+                .map(|p| p.parser.screen().cursor_position());
+            if let (Some(l), Some((crow, ccol))) = (self.layout.as_ref(), cursor) {
+                if (crow as usize) < l.rows && (ccol as usize) < l.cols {
+                    let origin = Pos2::new(
+                        l.origin.x + ccol as f32 * l.glyph_w,
+                        l.origin.y + crow as f32 * l.line_h,
+                    );
+                    let pane_rect = Rect::from_min_size(
+                        l.origin,
+                        Vec2::new(l.cols as f32 * l.glyph_w, l.rows as f32 * l.line_h),
+                    );
+                    let cursor_rect =
+                        Rect::from_min_size(origin, Vec2::new(l.glyph_w, l.line_h));
+                    ctx.output_mut(|o| {
+                        o.ime = Some(egui::output::IMEOutput {
+                            rect: pane_rect,
+                            cursor_rect,
+                        })
+                    });
+                }
             }
         }
 
@@ -1368,6 +1474,7 @@ impl App {
                     e,
                     egui::Event::Key { .. }
                         | egui::Event::Text(_)
+                        | egui::Event::Ime(_)
                         | egui::Event::Copy
                         | egui::Event::Cut
                         | egui::Event::Paste(_)
@@ -2457,6 +2564,41 @@ impl App {
             }
         }
 
+        // IME preedit overlay: draw the composition string at the cursor cell
+        // in the terminal font, underlined, so composing is visible on screen.
+        // Overwrites the cursor cell (and any following cells it covers).
+        if self.focus == Focus::Terminal {
+            if let Some(p) = self.preedit.as_deref() {
+                if !p.is_empty() {
+                    let (crow, ccol) = screen.cursor_position();
+                    if (crow as usize) < draw_rows && (ccol as usize) < draw_cols {
+                        let x = origin.x + ccol as f32 * glyph_w;
+                        let y = origin.y + crow as f32 * line_h;
+                        let w = p.chars().count() as f32 * glyph_w;
+                        painter.rect_filled(
+                            Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, line_h)),
+                            0.0,
+                            DEFAULT_BG,
+                        );
+                        painter.text(
+                            Pos2::new(x, y),
+                            egui::Align2::LEFT_TOP,
+                            p,
+                            font_id.clone(),
+                            DEFAULT_FG,
+                        );
+                        painter.line_segment(
+                            [
+                                Pos2::new(x, y + line_h - 1.5),
+                                Pos2::new(x + w, y + line_h - 1.5),
+                            ],
+                            (1.0, DEFAULT_FG),
+                        );
+                    }
+                }
+            }
+        }
+
         if !alive {
             let msg = "[ session ended — press Enter to reconnect, or pick another session ]";
             painter.rect_filled(
@@ -2972,7 +3114,7 @@ fn cell_bg(
     selection: &Option<Selection>,
 ) -> Color32 {
     if let Some(sel) = selection {
-        if sel.contains(row, col) {
+        if sel.contains(screen, row, col) {
             return SELECTION_BG;
         }
     }
