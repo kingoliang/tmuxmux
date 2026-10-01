@@ -649,6 +649,25 @@ fn main() {
         native_options,
         Box::new(move |cc| {
             cc.egui_ctx.style_mut(|s| s.visuals = egui::Visuals::dark());
+            // LOCAL PATCH (not upstream): egui 0.34's built-in fonts carry no CJK
+            // coverage, so Han/Hiragana/Hangul resolve to the replacement box. Read
+            // a system CJK face at startup and APPEND it to each family — Hack must
+            // stay first, because the terminal grid sizes cells from glyph_width of
+            // 'M' in the Monospace family and a leading CJK face would skew it.
+            // Missing/unreadable font leaves stock fonts, so the app still starts.
+            let mut fonts = egui::FontDefinitions::default();
+            if let Ok(bytes) = std::fs::read("/Library/Fonts/Arial Unicode.ttf") {
+                fonts.font_data.insert(
+                    "cjk".to_owned(),
+                    std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+                );
+                for family in [egui::FontFamily::Monospace, egui::FontFamily::Proportional] {
+                    if let Some(list) = fonts.families.get_mut(&family) {
+                        list.push("cjk".to_owned());
+                    }
+                }
+                cc.egui_ctx.set_fonts(fonts);
+            }
             Ok(Box::new(MainApp {
                 inner: App::new(cfg, path.clone(), db_path, cache_interval),
                 script: steps,

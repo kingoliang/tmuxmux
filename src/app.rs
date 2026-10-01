@@ -328,7 +328,7 @@ impl App {
             modal: None,
             layout: None,
             status: "loading sessions...".into(),
-            font_size: 14.0,
+            font_size: 17.0,
         };
         if key_generated {
             app.status = "generated a new SSH key in ~/.ssh for key-based access".into();
