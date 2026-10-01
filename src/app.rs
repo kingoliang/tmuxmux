@@ -202,6 +202,9 @@ pub struct App {
     pub modal: Option<AppModal>,
 
     layout: Option<TermLayout>,
+    /// Live IME composition string, drawn at the terminal cursor while the
+    /// user is composing. `None` when not composing.
+    preedit: Option<String>,
     status: String,
     font_size: f32,
 }
@@ -327,6 +330,7 @@ impl App {
             clipboard,
             modal: None,
             layout: None,
+            preedit: None,
             status: "loading sessions...".into(),
             font_size: 17.0,
         };
@@ -1079,6 +1083,19 @@ impl App {
         self.panes.get_mut(&key)
     }
 
+    /// Encode committed text for the pty. Shared by `Event::Text` and IME
+    /// commits so the encoding lives in exactly one place: Alt+letter still
+    /// sends an ESC prefix (these events carry no modifiers of their own, so
+    /// the caller passes the live modifier state).
+    fn send_text(&mut self, t: &str, modifiers: egui::Modifiers) {
+        let mut data = Vec::new();
+        if modifiers.alt && !modifiers.ctrl {
+            data.push(0x1b);
+        }
+        data.extend_from_slice(t.as_bytes());
+        self.write_pty(&data);
+    }
+
     fn write_pty(&mut self, data: &[u8]) {
         if data.is_empty() {
             return;
@@ -1312,16 +1329,7 @@ impl App {
                 }
                 egui::Event::Text(t) => {
                     match self.focus {
-                        Focus::Terminal => {
-                            let mut data = Vec::new();
-                            // Alt+letter sends ESC prefix (Text events carry no
-                            // modifiers, so consult the live modifier state).
-                            if modifiers.alt && !modifiers.ctrl {
-                                data.push(0x1b);
-                            }
-                            data.extend_from_slice(t.as_bytes());
-                            self.write_pty(&data);
-                        }
+                        Focus::Terminal => self.send_text(t, modifiers),
                         Focus::Tree => {
                             match t.as_str() {
                                 "j" => self.handle_tree_key(egui::Key::ArrowDown),
@@ -1354,7 +1362,61 @@ impl App {
                         self.write_pty(&[0x16]);
                     }
                 }
+                // OS input-method composition. A commit takes the same pty
+                // path as Event::Text; preedit is purely visual feedback.
+                egui::Event::Ime(ime) => {
+                    if self.focus == Focus::Terminal {
+                        match ime {
+                            egui::ImeEvent::Commit(t) => {
+                                self.preedit = None;
+                                self.send_text(t, modifiers);
+                                ctx.request_repaint();
+                            }
+                            egui::ImeEvent::Preedit(t) => {
+                                self.preedit = (!t.is_empty()).then(|| t.clone());
+                                ctx.request_repaint();
+                            }
+                            egui::ImeEvent::Disabled => {
+                                self.preedit = None;
+                                ctx.request_repaint();
+                            }
+                            egui::ImeEvent::Enabled => {}
+                        }
+                    }
+                }
                 _ => {}
+            }
+        }
+
+        // Let egui-winit enable IME for the terminal pane: it derives
+        // `window.set_ime_allowed` from `output.ime` being `Some`. This is
+        // done here rather than in `render_terminal` because `handle_events`
+        // runs first and returns early while a modal (or the sidebar filter)
+        // owns keyboard focus — in that case the TextEdit writes `output.ime`
+        // itself, later in the same frame, and therefore wins.
+        if self.focus == Focus::Terminal {
+            let cursor = self
+                .active_pane_mut()
+                .map(|p| p.parser.screen().cursor_position());
+            if let (Some(l), Some((crow, ccol))) = (self.layout.as_ref(), cursor) {
+                if (crow as usize) < l.rows && (ccol as usize) < l.cols {
+                    let origin = Pos2::new(
+                        l.origin.x + ccol as f32 * l.glyph_w,
+                        l.origin.y + crow as f32 * l.line_h,
+                    );
+                    let pane_rect = Rect::from_min_size(
+                        l.origin,
+                        Vec2::new(l.cols as f32 * l.glyph_w, l.rows as f32 * l.line_h),
+                    );
+                    let cursor_rect =
+                        Rect::from_min_size(origin, Vec2::new(l.glyph_w, l.line_h));
+                    ctx.output_mut(|o| {
+                        o.ime = Some(egui::output::IMEOutput {
+                            rect: pane_rect,
+                            cursor_rect,
+                        })
+                    });
+                }
             }
         }
 
@@ -1368,6 +1430,7 @@ impl App {
                     e,
                     egui::Event::Key { .. }
                         | egui::Event::Text(_)
+                        | egui::Event::Ime(_)
                         | egui::Event::Copy
                         | egui::Event::Cut
                         | egui::Event::Paste(_)
@@ -2453,6 +2516,41 @@ impl App {
                         (1.0, DEFAULT_FG),
                         egui::StrokeKind::Inside,
                     );
+                }
+            }
+        }
+
+        // IME preedit overlay: draw the composition string at the cursor cell
+        // in the terminal font, underlined, so composing is visible on screen.
+        // Overwrites the cursor cell (and any following cells it covers).
+        if self.focus == Focus::Terminal {
+            if let Some(p) = self.preedit.as_deref() {
+                if !p.is_empty() {
+                    let (crow, ccol) = screen.cursor_position();
+                    if (crow as usize) < draw_rows && (ccol as usize) < draw_cols {
+                        let x = origin.x + ccol as f32 * glyph_w;
+                        let y = origin.y + crow as f32 * line_h;
+                        let w = p.chars().count() as f32 * glyph_w;
+                        painter.rect_filled(
+                            Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, line_h)),
+                            0.0,
+                            DEFAULT_BG,
+                        );
+                        painter.text(
+                            Pos2::new(x, y),
+                            egui::Align2::LEFT_TOP,
+                            p,
+                            font_id.clone(),
+                            DEFAULT_FG,
+                        );
+                        painter.line_segment(
+                            [
+                                Pos2::new(x, y + line_h - 1.5),
+                                Pos2::new(x + w, y + line_h - 1.5),
+                            ],
+                            (1.0, DEFAULT_FG),
+                        );
+                    }
                 }
             }
         }
